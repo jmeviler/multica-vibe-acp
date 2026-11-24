@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from pathlib import Path
+import sys
+
+VIBE_ACP = os.environ.get("VIBE_ACP", "vibe-acp")
+
+
+def translate_model_request(raw: bytes) -> bytes:
+    message: object = json.loads(raw)
+    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+        raise ValueError("Expected an ACP JSON-RPC object")
+    if message.get("method") != "session/set_model":
+        return raw
+    params = message.get("params")
+    if not isinstance(params, dict):
+        raise ValueError("Model selection requires an ACP parameter object")
+    for field in ("sessionId", "modelId"):
+        value = params.get(field)
+        if not isinstance(value, str) or value.strip() == "":
+            raise ValueError(f"Model selection requires a non-empty {field}")
+    if "id" not in message:
+        raise ValueError("Model selection requires a request ID")
+    return (json.dumps({
+        **message,
+        "method": "session/set_config_option",
+        "params": {
+            "sessionId": params["sessionId"],
+            "configId": "model",
+            "value": params["modelId"],
+        },
+    }, separators=(",", ":")) + "\n").encode()
+
+
+async def forward_requests(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    while raw := await reader.readline():
+        writer.write(translate_model_request(raw))
+        await writer.drain()
+
+
+async def serve() -> int:
+    reader = asyncio.StreamReader(limit=4 * 1024 * 1024)
+    transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+        lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer
+    )
+    process = await asyncio.create_subprocess_exec(
+        VIBE_ACP, stdin=asyncio.subprocess.PIPE
+    )
+    if process.stdin is None:
+        raise RuntimeError("Vibe ACP stdin pipe was not created")
+    forwarding = asyncio.create_task(forward_requests(reader, process.stdin))
+    exited = asyncio.create_task(process.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {forwarding, exited}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if forwarding in done:
+            await forwarding
+            process.stdin.close()
+        return await exited
+    finally:
+        transport.close()
+        forwarding.cancel()
+        if process.returncode is None:
+            process.kill()
+        await exited
+
+
+def main() -> int:
+    if VIBE_ACP.strip() == "":
+        raise ValueError("VIBE_ACP must not be empty")
+    if sys.argv[1:] in (["--version"], ["-v"]):
+        os.execvp(VIBE_ACP, [VIBE_ACP, "--version"])
+    if sys.argv[1:] != ["acp"]:
+        raise ValueError("Vibe compatibility launcher accepts only acp or --version")
+
+    hermes_home = os.environ.get("HERMES_HOME")
+    if hermes_home is not None:
+        source = Path(hermes_home) / "skills"
+        target = Path.cwd() / ".vibe" / "skills"
+        if source.is_dir():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink() and target.resolve() != source.resolve():
+                target.unlink()
+            if not target.is_symlink():
+                target.symlink_to(source, target_is_directory=True)
+
+    return asyncio.run(serve())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
